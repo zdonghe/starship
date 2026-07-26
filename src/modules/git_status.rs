@@ -453,15 +453,33 @@ fn get_repo_status(
                     .ok()
             })
         {
-            let output = repo.exec_git(
-                context,
-                ["for-each-ref", "--format", "%(upstream) %(upstream:track)"]
-                    .into_iter()
-                    .map(ToOwned::to_owned)
-                    .chain(Some(branch_name)),
-            )?;
-            if let Some(line) = output.stdout.lines().next() {
-                repo_status.set_ahead_behind_for_each_ref(line);
+            if let Some(reference) = gix_repo.find_reference(branch_name.as_str()).ok() {
+                let local_oid = reference.try_id();
+                let upstream_name = reference
+                    .remote_tracking_ref_name(gix::remote::Direction::Fetch)
+                    .and_then(|r| r.ok())
+                    .map(|cow| cow.into_owned());
+
+                if let (Some(local_oid), Some(upstream_name)) = (local_oid, upstream_name) {
+                    let upstream_oid = gix_repo
+                        .find_reference(upstream_name.as_ref())
+                        .ok()
+                        .and_then(|r| r.try_id());
+
+                    if let Some(upstream_oid) = upstream_oid {
+                        if let (Ok(ahead), Ok(behind)) = (
+                            gix_repo.rev_walk([local_oid])
+                                .with_hidden([upstream_oid])
+                                .all(),
+                            gix_repo.rev_walk([upstream_oid])
+                                .with_hidden([local_oid])
+                                .all(),
+                        ) {
+                            repo_status.ahead = Some(ahead.count());
+                            repo_status.behind = Some(behind.count());
+                        }
+                    }
+                }
             }
         }
 
@@ -720,36 +738,6 @@ impl RepoStatus {
         }
     }
 
-    fn set_ahead_behind_for_each_ref(&mut self, mut s: &str) {
-        if s == " " || s.ends_with(" [gone]") {
-            self.ahead = None;
-            self.behind = None;
-            return;
-        }
-
-        s = s
-            .split_once(' ')
-            .unwrap()
-            .1
-            .trim_matches(|c| c == '[' || c == ']');
-
-        for pair in s.split(',') {
-            let mut tokens = pair.trim().splitn(2, ' ');
-            if let (Some(name), Some(number)) = (tokens.next(), tokens.next()) {
-                let storage = match name {
-                    "ahead" => &mut self.ahead,
-                    "behind" => &mut self.behind,
-                    _ => return,
-                };
-                *storage = number.parse().ok();
-            }
-        }
-        for field in [&mut self.ahead, &mut self.behind] {
-            if field.is_none() {
-                *field = Some(0);
-            }
-        }
-    }
 }
 
 fn format_text<F>(
