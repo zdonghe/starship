@@ -2,7 +2,7 @@ use clap::{ValueEnum, builder::PossibleValue};
 use nu_ansi_term::AnsiStrings;
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::{Debug, Write as FmtWrite};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -176,6 +176,78 @@ pub fn module(module_name: &str, args: Properties) {
 
 pub fn get_module(module_name: &str, context: &Context) -> Option<String> {
     modules::handle(module_name, context).map(|m| m.to_string())
+}
+
+pub type ModuleCache = HashMap<String, Vec<Segment>>;
+
+pub fn get_module_segments(module_name: &str, context: &Context) -> Option<Vec<Segment>> {
+    modules::handle(module_name, context).map(|m| m.segments)
+}
+
+pub fn get_prompt_with_cache(context: &Context, cache: &ModuleCache, format_str: &str) -> String {
+    let config = &context.root_config;
+    let mut buf = String::new();
+
+    let modules: BTreeSet<String> = StringFormatter::new(format_str)
+        .map(|f| f.get_variables().into_iter().collect())
+        .unwrap_or_default();
+
+    if Shell::Fish == context.shell && context.target == Target::Main {
+        buf.push_str("\x1b[J");
+    }
+
+    let formatter = StringFormatter::new(format_str).expect("Invalid format string");
+    let formatter = formatter.map_variables_to_segments(|module| {
+        if module == "all" {
+            Some(Ok(all_modules_uniq(&modules)
+                .par_iter()
+                .flat_map(|m| {
+                    if let Some(segments) = cache.get(m.as_str()) {
+                        segments.clone()
+                    } else {
+                        handle_module(m, context, &modules)
+                            .into_iter()
+                            .flat_map(|m| m.segments)
+                            .collect::<Vec<Segment>>()
+                    }
+                })
+                .collect()))
+        } else if context.is_module_disabled_in_config(module) {
+            None
+        } else {
+            Some(Ok(cache.get(module).cloned().unwrap_or_else(|| {
+                handle_module(module, context, &modules)
+                    .into_iter()
+                    .flat_map(|m| m.segments)
+                    .collect()
+            })))
+        }
+    });
+
+    let mut root_module = Module::new("Starship Root", "The root module", None);
+    root_module.set_segments(
+        formatter
+            .parse(None, Some(context))
+            .expect("Unexpected error in root format variables"),
+    );
+
+    let module_strings = root_module.ansi_strings_for_width(Some(context.width));
+    if config.add_newline && context.target != Target::Continuation {
+        writeln!(buf).unwrap();
+    }
+    let shell_wrapped_output =
+        wrap_colorseq_for_shell(AnsiStrings(&module_strings).to_string(), context.shell);
+    write!(buf, "{shell_wrapped_output}").unwrap();
+
+    if context.target == Target::Right {
+        buf = buf.replace('\n', "");
+    }
+    if context.shell == Shell::Tcsh {
+        buf = buf.replace('!', "\\!");
+        buf = buf.replace('\n', " \\n");
+    }
+
+    buf
 }
 
 pub fn timings(args: Properties) {
@@ -866,5 +938,132 @@ mod test {
         let expected = "user profile";
         let actual = get_prompt(&context);
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn get_module_segments_returns_segments() {
+        let context = default_context().set_config(toml::toml! {
+            add_newline = false
+            format = "$character"
+            [character]
+            format = ">"
+        });
+        let segs = get_module_segments("character", &context);
+        assert!(segs.is_some());
+        assert!(!segs.unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_module_segments_none_for_disabled() {
+        let context = default_context().set_config(toml::toml! {
+            [time]
+            disabled = true
+        });
+        assert!(get_module_segments("time", &context).is_none());
+    }
+
+    #[test]
+    fn get_prompt_with_cache_matches_get_prompt() {
+        let mut context = default_context().set_config(toml::toml! {
+            add_newline = false
+            format = "$character"
+            [character]
+            format = ">"
+        });
+        context.current_dir = std::env::temp_dir();
+
+        let segs = get_module_segments("character", &context).unwrap();
+        let mut cache = ModuleCache::new();
+        cache.insert("character".to_string(), segs);
+
+        let expected = get_prompt(&context);
+        let actual = get_prompt_with_cache(&context, &cache, "$character");
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn get_prompt_with_cache_uses_fresh_render_for_missing() {
+        let context = default_context().set_config(toml::toml! {
+            add_newline = false
+            format = "$character"
+            [character]
+            format = ">"
+        });
+        let empty_cache = ModuleCache::new();
+        let expected = get_prompt(&context);
+        let actual = get_prompt_with_cache(&context, &empty_cache, "$character");
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn get_prompt_with_cache_time_isolation() {
+        let mut context = default_context().set_config(toml::toml! {
+            add_newline = false
+            format = "$character$time"
+            [character]
+            format = "> "
+            [time]
+            disabled = false
+            format = "🕐[$time](bold yellow)"
+            time_format = "%H:%M"
+        });
+        context.current_dir = std::env::temp_dir();
+
+        let char_segs = get_module_segments("character", &context).unwrap();
+        let time_segs = get_module_segments("time", &context).unwrap();
+        let mut cache = ModuleCache::new();
+        cache.insert("character".to_string(), char_segs);
+        cache.insert("time".to_string(), time_segs);
+
+        let full = get_prompt(&context);
+        let cached = get_prompt_with_cache(&context, &cache, "$character$time");
+        assert_eq!(full, cached);
+
+        let time_segs2 = get_module_segments("time", &context).unwrap();
+        cache.insert("time".to_string(), time_segs2);
+        let cached2 = get_prompt_with_cache(&context, &cache, "$character$time");
+        assert_eq!(full, cached2);
+    }
+
+    #[test]
+    fn get_prompt_with_cache_handles_format_parse_errors() {
+        let context = default_context().set_config(toml::toml! {
+            add_newline = false
+            format = "$character"
+            [character]
+            format = ">"
+        });
+        let cache = ModuleCache::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            get_prompt_with_cache(&context, &cache, "[)$invalid(");
+        }));
+        assert!(result.is_err(), "invalid format should panic via expect");
+    }
+
+    #[test]
+    fn get_prompt_with_cache_empty_format() {
+        let context = default_context().set_config(toml::toml! {
+            add_newline = false
+            format = ""
+        });
+        let cache = ModuleCache::new();
+        let expected = get_prompt(&context);
+        let actual = get_prompt_with_cache(&context, &cache, "");
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn get_prompt_with_cache_strips_newlines_in_right_prompt() {
+        let context = default_context();
+        let mut cache = ModuleCache::new();
+
+        let char_segs = get_module_segments("character", &context).unwrap();
+        cache.insert("character".to_string(), char_segs);
+        cache.insert("line_break".to_string(), Vec::new());
+
+        let mut right_ctx = context;
+        right_ctx.target = Target::Right;
+        let result = get_prompt_with_cache(&right_ctx, &cache, "$character");
+        assert!(!result.contains('\n'), "right prompts should not have newlines");
     }
 }
