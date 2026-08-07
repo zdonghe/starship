@@ -457,8 +457,7 @@ fn get_repo_status(
                 let local_oid = reference.try_id();
                 let upstream_name = reference
                     .remote_tracking_ref_name(gix::remote::Direction::Fetch)
-                    .and_then(|r| r.ok())
-                    .map(|cow| cow.into_owned());
+                    .and_then(|r| r.ok());
 
                 if let (Some(local_oid), Some(upstream_name)) = (local_oid, upstream_name) {
                     let upstream_oid = gix_repo
