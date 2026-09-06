@@ -10,6 +10,13 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 
+static REPO_STATUS: parking_lot::Mutex<Option<(Arc<RepoStatus>, PathBuf)>> =
+    parking_lot::Mutex::new(None);
+
+pub fn bust_repo_status() {
+    *REPO_STATUS.lock() = None;
+}
+
 const ALL_STATUS_FORMAT: &str =
     "$conflicted$stashed$deleted$renamed$modified$typechanged$staged$untracked";
 
@@ -307,8 +314,6 @@ pub fn get_static_repo_status(
     repo: &context::GitRepo,
     config: &GitStatusConfig,
 ) -> Option<Arc<RepoStatus>> {
-    static REPO_STATUS: parking_lot::Mutex<Option<(Arc<RepoStatus>, PathBuf)>> =
-        parking_lot::Mutex::new(None);
     let mut status = REPO_STATUS.lock();
     let needs_update = status
         .as_ref()

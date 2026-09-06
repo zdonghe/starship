@@ -18,6 +18,7 @@ use crate::formatter::{StringFormatter, VariableHolder};
 use crate::module::ALL_MODULES;
 use crate::module::Module;
 use crate::modules;
+pub use crate::modules::git_status::bust_repo_status;
 use crate::segment::Segment;
 use crate::shadow;
 use crate::utils::wrap_colorseq_for_shell;
